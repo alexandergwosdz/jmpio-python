@@ -319,6 +319,37 @@ def test_compact_subtype_file():
     assert df["longcompact"].iloc[3] == z
     assert df["longcompact"].iloc[4] == z
 
+    df = read_jmp(os.path.join(TEST_DATA_DIR, "compact_UInt8.jmp"))
+    assert df.shape == (130, 1)
+    assert df["A"].iloc[:3].tolist() == ["a1", "a2", "a3"]
+    assert df["A"].iloc[-1] == "a130"
+
+    df = read_jmp(os.path.join(TEST_DATA_DIR, "compact_UInt16.jmp"))
+    assert df.shape == (32770, 1)
+    assert df["A"].iloc[-1] == "a32770"
+
+    df = read_jmp(os.path.join(TEST_DATA_DIR, "compact_UInt32.jmp"))
+    assert df.shape == (65537, 1)
+    assert df["A"].iloc[-1] == "a65537"
+
+
+def test_minusfour_column_info_marker():
+    """Test column metadata sections with a 0xfc 0xff marker."""
+    df = read_jmp(os.path.join(TEST_DATA_DIR, "minusfour.jmp"))
+
+    assert df.shape == (3, 1)
+    assert df["Column 1"].tolist() == ["a", "b", "c"]
+
+
+def test_bug_mwe4_truncates_fixed_strings_at_first_null():
+    """Test fixed-width strings containing internal null padding."""
+    df = read_jmp(os.path.join(TEST_DATA_DIR, "bugMWE4.jmp"))
+
+    assert df["c"].iloc[:3].tolist() == ["cat", "cat", "dolor sit amet"]
+    assert df["d"].iloc[:3].tolist() == ["bat", "bat", "consectetur adipiscing elit"]
+    assert df["e"].iloc[:3].tolist() == ["bird", "bird", "sed do eiusmod"]
+    assert df["f"].iloc[15:18].tolist() == ["foo", "bar", "hello world"]
+
 
 def test_column_filtering():
     """Test column filtering features"""

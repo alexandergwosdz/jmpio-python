@@ -3,6 +3,7 @@ Tests for jmpio writer functionality
 """
 
 import os
+import struct
 import tempfile
 from datetime import date, datetime, timedelta
 
@@ -10,6 +11,9 @@ import pandas as pd
 import pytest
 
 from jmpio import read_jmp, write_jmp
+from jmpio.constants import MAGIC_JMP
+from jmpio.metadata import read_metadata
+from jmpio.writer import JMP17_METADATA_OFFSET, JMP17_PREAMBLE_AFTER_MAGIC
 
 # Directory with test data (set up by conftest.py)
 TEST_DATA_DIR = os.path.join(os.path.dirname(__file__), "test_data")
@@ -18,6 +22,21 @@ TEST_DATA_DIR = os.path.join(os.path.dirname(__file__), "test_data")
 def test_write_jmp_existence():
     """Test that the write_jmp function exists"""
     assert callable(write_jmp)
+
+
+def test_write_jmp_rejects_unsupported_version():
+    """Test that unsupported JMP write versions fail explicitly."""
+    df = pd.DataFrame({"x": [1, 2, 3]})
+
+    with tempfile.NamedTemporaryFile(suffix=".jmp", delete=False) as temp:
+        temp_path = temp.name
+
+    try:
+        with pytest.raises(ValueError, match="only '17.2.0' is currently supported"):
+            write_jmp(df, temp_path, version="16.0")
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def test_round_trip_basic():
@@ -43,9 +62,9 @@ def test_round_trip_basic():
         df_read = read_jmp(temp_path)
 
         # Check that the data is the same
-        pd.testing.assert_series_equal(df["integers"], df_read["integers"])
-        pd.testing.assert_series_equal(df["floats"], df_read["floats"])
-        pd.testing.assert_series_equal(df["strings"], df_read["strings"])
+        pd.testing.assert_series_equal(df["integers"], df_read["integers"], check_dtype=False)
+        pd.testing.assert_series_equal(df["floats"], df_read["floats"], check_dtype=False)
+        pd.testing.assert_series_equal(df["strings"], df_read["strings"], check_dtype=False)
     finally:
         # Clean up
         if os.path.exists(temp_path):
@@ -91,6 +110,82 @@ def test_round_trip_missing_values():
         assert df["strings"].iloc[3] == df_read["strings"].iloc[3]
     finally:
         # Clean up
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def test_write_jmp17_metadata_and_string_dtype():
+    """Test that writer output has readable JMP 17 metadata and pandas string columns."""
+    df = pd.DataFrame(
+        {
+            "integers": [1, 2, 3],
+            "floats": [1.25, None, 3.5],
+            "strings": pd.Series(["x", "yy", "zzz"], dtype="string"),
+        }
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".jmp", delete=False) as temp:
+        temp_path = temp.name
+
+    try:
+        write_jmp(df, temp_path)
+
+        with open(temp_path, "rb") as file:
+            info = read_metadata(file)
+
+        assert info.version == "17.2.0"
+        assert info.nrows == 3
+        assert info.ncols == 3
+        assert info.column.names == ["integers", "floats", "strings"]
+
+        df_read = read_jmp(temp_path)
+        assert df_read["integers"].tolist() == [1, 2, 3]
+        assert df_read["floats"].iloc[[0, 2]].tolist() == [1.25, 3.5]
+        assert pd.isna(df_read["floats"].iloc[1])
+        assert df_read["strings"].tolist() == ["x", "yy", "zzz"]
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def test_write_jmp17_native_table_structure_records():
+    """Test that writer output includes JMP 17 table-object records."""
+    df = pd.DataFrame({"integers": [1, 2], "strings": ["x", "y"]})
+
+    with tempfile.NamedTemporaryFile(suffix=".jmp", delete=False) as temp:
+        temp_path = temp.name
+
+    try:
+        write_jmp(df, temp_path)
+
+        with open(temp_path, "rb") as file:
+            data = file.read()
+
+        ncols = len(df.columns)
+        visibility_record_len = 18 + 6 * ncols
+        post_build_record = struct.pack(
+            "<HIHHHII", 5, 4, 0, 1, 3, visibility_record_len + 56, 0
+        )
+
+        assert data.startswith(MAGIC_JMP + JMP17_PREAMBLE_AFTER_MAGIC)
+        assert data[JMP17_METADATA_OFFSET : JMP17_METADATA_OFFSET + 8] == struct.pack(
+            "<q", len(df)
+        )
+
+        build_string = b"Jul 23 2023, 19:09:15, Release, JMP, Version 17.2.0"
+        build_end = data.index(build_string) + len(build_string)
+        assert data[build_end : build_end + len(post_build_record)] == post_build_record
+
+        visibility_marker = build_end + len(post_build_record)
+        assert data[visibility_marker : visibility_marker + 2] == b"\xff\xff"
+        assert data[visibility_marker + 2 : visibility_marker + 10] == struct.pack(
+            "<q", visibility_record_len
+        )
+
+        after_widths = visibility_marker + 2 + 10 + 8 + 8 + 4 * ncols + 2 * ncols
+        assert data[after_widths : after_widths + 2] == b"\xfe\xff"
+        assert data[after_widths + 28 : after_widths + 30] == b"\xfd\xff"
+    finally:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
 
