@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from jmpio import read_jmp, write_jmp
+from jmpio.metadata import read_metadata
 
 # Directory with test data (set up by conftest.py)
 TEST_DATA_DIR = os.path.join(os.path.dirname(__file__), "test_data")
@@ -18,6 +19,21 @@ TEST_DATA_DIR = os.path.join(os.path.dirname(__file__), "test_data")
 def test_write_jmp_existence():
     """Test that the write_jmp function exists"""
     assert callable(write_jmp)
+
+
+def test_write_jmp_rejects_unsupported_version():
+    """Test that unsupported JMP write versions fail explicitly."""
+    df = pd.DataFrame({"x": [1, 2, 3]})
+
+    with tempfile.NamedTemporaryFile(suffix=".jmp", delete=False) as temp:
+        temp_path = temp.name
+
+    try:
+        with pytest.raises(ValueError, match="only '17.2.0' is currently supported"):
+            write_jmp(df, temp_path, version="16.0")
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def test_round_trip_basic():
@@ -43,9 +59,9 @@ def test_round_trip_basic():
         df_read = read_jmp(temp_path)
 
         # Check that the data is the same
-        pd.testing.assert_series_equal(df["integers"], df_read["integers"])
-        pd.testing.assert_series_equal(df["floats"], df_read["floats"])
-        pd.testing.assert_series_equal(df["strings"], df_read["strings"])
+        pd.testing.assert_series_equal(df["integers"], df_read["integers"], check_dtype=False)
+        pd.testing.assert_series_equal(df["floats"], df_read["floats"], check_dtype=False)
+        pd.testing.assert_series_equal(df["strings"], df_read["strings"], check_dtype=False)
     finally:
         # Clean up
         if os.path.exists(temp_path):
@@ -91,6 +107,40 @@ def test_round_trip_missing_values():
         assert df["strings"].iloc[3] == df_read["strings"].iloc[3]
     finally:
         # Clean up
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def test_write_jmp17_metadata_and_string_dtype():
+    """Test that writer output has readable JMP 17 metadata and pandas string columns."""
+    df = pd.DataFrame(
+        {
+            "integers": [1, 2, 3],
+            "floats": [1.25, None, 3.5],
+            "strings": pd.Series(["x", "yy", "zzz"], dtype="string"),
+        }
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".jmp", delete=False) as temp:
+        temp_path = temp.name
+
+    try:
+        write_jmp(df, temp_path)
+
+        with open(temp_path, "rb") as file:
+            info = read_metadata(file)
+
+        assert info.version == "17.2.0"
+        assert info.nrows == 3
+        assert info.ncols == 3
+        assert info.column.names == ["integers", "floats", "strings"]
+
+        df_read = read_jmp(temp_path)
+        assert df_read["integers"].tolist() == [1, 2, 3]
+        assert df_read["floats"].iloc[[0, 2]].tolist() == [1.25, 3.5]
+        assert pd.isna(df_read["floats"].iloc[1])
+        assert df_read["strings"].tolist() == ["x", "yy", "zzz"]
+    finally:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
 

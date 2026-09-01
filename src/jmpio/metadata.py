@@ -121,7 +121,7 @@ def column_info(file: BinaryIO, ncols: int) -> tuple[list[str], list[int]]:
             raise EOFError("Unexpected end of file when searching for column information")
 
         # Check for special marker bytes
-        if twobytes in [b"\xfd\xff", b"\xfe\xff", b"\xff\xff"]:
+        if twobytes in [b"\xfc\xff", b"\xfd\xff", b"\xfe\xff", b"\xff\xff"]:
             n = struct.unpack("<q", file.read(8))[0]  # Int64, little-endian
             _ = file.read(n)  # Skip this data
         else:
