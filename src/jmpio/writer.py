@@ -20,6 +20,7 @@ from .constants import (
 )
 from .types import RowState
 
+SUPPORTED_WRITE_VERSION = "17.2.0"
 JMP17_METADATA_OFFSET = 368
 JMP17_PREAMBLE_AFTER_MAGIC = bytes.fromhex(
     """
@@ -57,7 +58,12 @@ def _column_visibility_record_len(n_visible: int, n_hidden: int) -> int:
     return 18 + 4 * (n_visible + n_hidden) + 2 * (n_visible + n_hidden)
 
 
-def write_jmp(df: pd.DataFrame, filename: str, compress: bool = True, version: str = "17.2.0") -> None:
+def write_jmp(
+    df: pd.DataFrame,
+    filename: str,
+    compress: bool = True,
+    version: str = SUPPORTED_WRITE_VERSION,
+) -> None:
     """
     Write a pandas DataFrame to a JMP file
 
@@ -70,7 +76,7 @@ def write_jmp(df: pd.DataFrame, filename: str, compress: bool = True, version: s
     compress : bool, default=True
         Whether to compress the data
     version : str, default="17.2.0"
-        JMP version to use in the file header
+        JMP file version to write. Currently only "17.2.0" is supported.
 
     Returns:
     --------
@@ -91,6 +97,12 @@ def write_jmp(df: pd.DataFrame, filename: str, compress: bool = True, version: s
     >>> # Write to a JMP file
     >>> jmpio.write_jmp(df, 'output.jmp')
     """
+    if version != SUPPORTED_WRITE_VERSION:
+        raise ValueError(
+            f"Unsupported JMP write version {version!r}; "
+            f"only {SUPPORTED_WRITE_VERSION!r} is currently supported"
+        )
+
     # Create directory if it doesn't exist
     directory = os.path.dirname(os.path.abspath(filename))
     if directory and not os.path.exists(directory):
