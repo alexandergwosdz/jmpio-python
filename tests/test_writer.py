@@ -3,6 +3,7 @@ Tests for jmpio writer functionality
 """
 
 import os
+import struct
 import tempfile
 from datetime import date, datetime, timedelta
 
@@ -10,7 +11,9 @@ import pandas as pd
 import pytest
 
 from jmpio import read_jmp, write_jmp
+from jmpio.constants import MAGIC_JMP
 from jmpio.metadata import read_metadata
+from jmpio.writer import JMP17_METADATA_OFFSET, JMP17_PREAMBLE_AFTER_MAGIC
 
 # Directory with test data (set up by conftest.py)
 TEST_DATA_DIR = os.path.join(os.path.dirname(__file__), "test_data")
@@ -125,6 +128,48 @@ def test_write_jmp17_metadata_and_string_dtype():
         assert df_read["floats"].iloc[[0, 2]].tolist() == [1.25, 3.5]
         assert pd.isna(df_read["floats"].iloc[1])
         assert df_read["strings"].tolist() == ["x", "yy", "zzz"]
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def test_write_jmp17_native_table_structure_records():
+    """Test that writer output includes JMP 17 table-object records."""
+    df = pd.DataFrame({"integers": [1, 2], "strings": ["x", "y"]})
+
+    with tempfile.NamedTemporaryFile(suffix=".jmp", delete=False) as temp:
+        temp_path = temp.name
+
+    try:
+        write_jmp(df, temp_path)
+
+        with open(temp_path, "rb") as file:
+            data = file.read()
+
+        ncols = len(df.columns)
+        visibility_record_len = 18 + 6 * ncols
+        post_build_record = struct.pack(
+            "<HIHHHII", 5, 4, 0, 1, 3, visibility_record_len + 56, 0
+        )
+
+        assert data.startswith(MAGIC_JMP + JMP17_PREAMBLE_AFTER_MAGIC)
+        assert data[JMP17_METADATA_OFFSET : JMP17_METADATA_OFFSET + 8] == struct.pack(
+            "<q", len(df)
+        )
+
+        build_string = b"Jul 23 2023, 19:09:15, Release, JMP, Version 17.2.0"
+        build_end = data.index(build_string) + len(build_string)
+        assert data[build_end : build_end + len(post_build_record)] == post_build_record
+
+        visibility_marker = build_end + len(post_build_record)
+        assert data[visibility_marker : visibility_marker + 2] == b"\xff\xff"
+        assert data[visibility_marker + 2 : visibility_marker + 10] == struct.pack(
+            "<q", visibility_record_len
+        )
+
+        after_widths = visibility_marker + 2 + 10 + 8 + 8 + 4 * ncols + 2 * ncols
+        assert data[after_widths : after_widths + 2] == b"\xfe\xff"
+        assert data[after_widths + 28 : after_widths + 30] == b"\xfd\xff"
     finally:
         if os.path.exists(temp_path):
             os.unlink(temp_path)

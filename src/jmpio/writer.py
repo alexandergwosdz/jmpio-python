@@ -20,6 +20,42 @@ from .constants import (
 )
 from .types import RowState
 
+JMP17_METADATA_OFFSET = 368
+JMP17_PREAMBLE_AFTER_MAGIC = bytes.fromhex(
+    """
+    12 00 00 00 00 00 00 00 00 00 06 00 06 00 00 00
+    75 74 66 2d 38 00 00 00 07 57 61 72 6e 69 6e 67
+    20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20
+    20 20 20 20 20 20 20 20 02 02 00 00 43 00 01 00
+    01 00 08 00 00 00 00 00 02 00 00 00 00 00 37 54
+    68 69 73 20 64 61 74 61 20 74 61 62 6c 65 20 68
+    61 64 20 62 65 65 6e 20 73 61 76 65 64 20 69 6e
+    20 61 20 6d 6f 72 65 20 72 65 63 65 6e 74 20 66
+    6f 72 6d 61 74 2e 00 00 00 00 00 00 00 00 00 00
+    00 42 49 74 20 69 73 20 6e 6f 74 20 63 6f 6d 70
+    61 74 69 62 6c 65 20 77 69 74 68 20 74 68 65 20
+    66 6f 72 6d 61 74 20 6b 6e 6f 77 6e 20 74 6f 20
+    74 68 69 73 20 76 65 72 73 69 6f 6e 20 6f 66 20
+    4a 4d 50 2e 1d 50 6c 65 61 73 65 20 64 6f 20 6e
+    6f 74 20 73 61 76 65 20 74 68 69 73 20 74 61 62
+    6c 65 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    00 00 00 00 00 00 00 41 53 61 76 69 6e 67 20 74
+    68 69 73 20 74 61 62 6c 65 20 77 69 74 68 20 74
+    68 69 73 20 76 65 72 73 69 6f 6e 20 6f 66 20 4a
+    4d 50 20 77 69 6c 6c 20 64 65 73 74 72 6f 79 20
+    74 68 65 20 64 61 74 61 2e 00 07 00 00 00
+    """
+)
+
+if len(MAGIC_JMP) + len(JMP17_PREAMBLE_AFTER_MAGIC) != JMP17_METADATA_OFFSET:
+    raise RuntimeError("JMP17 preamble length does not align with metadata offset")
+
+
+def _column_visibility_record_len(n_visible: int, n_hidden: int) -> int:
+    """Length field used by JMP 17 before visible/hidden column metadata."""
+    return 18 + 4 * (n_visible + n_hidden) + 2 * (n_visible + n_hidden)
+
 
 def write_jmp(df: pd.DataFrame, filename: str, compress: bool = True, version: str = "17.2.0") -> None:
     """
@@ -98,11 +134,11 @@ def write_file_header(file: BinaryIO, df: pd.DataFrame, version: str) -> None:
     version : str
         JMP version to use in the header
     """
-    # JMPReader.jl finds the table metadata by scanning for the byte sequence
-    # written inside foo2 below and then backing up to offset 368. Keep the
-    # preamble size aligned with JMP 17 files observed in the fixture set.
+    # JMP 17 places table metadata at byte 368 after a compatibility preamble.
+    # Native JMP-authored files in the fixture set share this preamble for
+    # ordinary data tables.
     file.write(MAGIC_JMP)
-    file.write(bytearray([0] * (368 - len(MAGIC_JMP))))
+    file.write(JMP17_PREAMBLE_AFTER_MAGIC)
 
     # Write number of rows (Int64) and columns (Int32)
     file.write(struct.pack("<q", len(df)))
@@ -134,6 +170,15 @@ def write_file_header(file: BinaryIO, df: pd.DataFrame, version: str) -> None:
     file.write(build_string)
 
 
+def write_post_build_table_object(file: BinaryIO, n_visible: int, n_hidden: int) -> None:
+    """
+    Write the small JMP 17 table-object record that precedes column metadata.
+    """
+    record_len = _column_visibility_record_len(n_visible, n_hidden)
+    object_size = record_len + 56
+    file.write(struct.pack("<HIHHHII", 5, 4, 0, 1, 3, object_size, 0))
+
+
 def write_column_metadata(file: BinaryIO, df: pd.DataFrame) -> int:
     """
     Write metadata about columns
@@ -150,21 +195,18 @@ def write_column_metadata(file: BinaryIO, df: pd.DataFrame) -> int:
     int
         File position where the Int64 column-offset table starts
     """
-    # Write column metadata section marker
-    file.write(b"\xff\xff")
-
-    # The reader skips exactly 10 bytes after this marker before reading the
-    # visible/hidden column counts.
-    file.write(struct.pack("<QH", 0, 0))
-
-    # Write visible and hidden column counts
-    # For now, all columns are visible
+    # For now, all columns are visible.
     n_visible = len(df.columns)
     n_hidden = 0
-    file.write(struct.pack("<II", n_visible, n_hidden))
 
-    # Write some unknown values
-    file.write(struct.pack("<II", 0, 0))
+    write_post_build_table_object(file, n_visible, n_hidden)
+
+    # Write column visibility metadata section marker. The length field and
+    # object ids are modeled on simple native JMP 17 data tables.
+    file.write(b"\xff\xff")
+    file.write(struct.pack("<QH", _column_visibility_record_len(n_visible, n_hidden), 0))
+    file.write(struct.pack("<II", n_visible, n_hidden))
+    file.write(struct.pack("<HHHH", 0, 0x0077, 0x0190, 0x02CF))
 
     # Write visible column indices (0-based)
     for i in range(n_visible):
@@ -176,9 +218,15 @@ def write_column_metadata(file: BinaryIO, df: pd.DataFrame) -> int:
         width = min(max(len(column_name) * 8, 40), 300)
         file.write(struct.pack("<H", width))
 
-    # Write some more unknown values
-    for _ in range(7):
-        file.write(struct.pack("<I", 0))
+    # Native JMP 17 files include a fixed 18-byte tagged record here. The
+    # reader preserves these bytes as seven UInt32 values for now.
+    file.write(b"\xfe\xff")
+    file.write(struct.pack("<qHIIII", 18, 3, 116, 112, 169, 113))
+
+    # Native JMP 17 files include one more tagged record before the offset
+    # table. column_info() skips this marker and payload before reading ncols.
+    file.write(b"\xfd\xff")
+    file.write(struct.pack("<qHHI", 8, 1, 4, 0))
 
     # Write the number of columns again as a check
     file.write(struct.pack("<i", len(df.columns)))
