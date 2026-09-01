@@ -21,6 +21,21 @@ def test_write_jmp_existence():
     assert callable(write_jmp)
 
 
+def test_write_jmp_rejects_unsupported_version():
+    """Test that unsupported JMP write versions fail explicitly."""
+    df = pd.DataFrame({"x": [1, 2, 3]})
+
+    with tempfile.NamedTemporaryFile(suffix=".jmp", delete=False) as temp:
+        temp_path = temp.name
+
+    try:
+        with pytest.raises(ValueError, match="only '17.2.0' is currently supported"):
+            write_jmp(df, temp_path, version="16.0")
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
 def test_round_trip_basic():
     """Test writing a simple DataFrame to a JMP file and reading it back"""
     # Create a simple DataFrame
