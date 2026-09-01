@@ -20,8 +20,50 @@ from .constants import (
 )
 from .types import RowState
 
+SUPPORTED_WRITE_VERSION = "17.2.0"
+JMP17_METADATA_OFFSET = 368
+JMP17_PREAMBLE_AFTER_MAGIC = bytes.fromhex(
+    """
+    12 00 00 00 00 00 00 00 00 00 06 00 06 00 00 00
+    75 74 66 2d 38 00 00 00 07 57 61 72 6e 69 6e 67
+    20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20
+    20 20 20 20 20 20 20 20 02 02 00 00 43 00 01 00
+    01 00 08 00 00 00 00 00 02 00 00 00 00 00 37 54
+    68 69 73 20 64 61 74 61 20 74 61 62 6c 65 20 68
+    61 64 20 62 65 65 6e 20 73 61 76 65 64 20 69 6e
+    20 61 20 6d 6f 72 65 20 72 65 63 65 6e 74 20 66
+    6f 72 6d 61 74 2e 00 00 00 00 00 00 00 00 00 00
+    00 42 49 74 20 69 73 20 6e 6f 74 20 63 6f 6d 70
+    61 74 69 62 6c 65 20 77 69 74 68 20 74 68 65 20
+    66 6f 72 6d 61 74 20 6b 6e 6f 77 6e 20 74 6f 20
+    74 68 69 73 20 76 65 72 73 69 6f 6e 20 6f 66 20
+    4a 4d 50 2e 1d 50 6c 65 61 73 65 20 64 6f 20 6e
+    6f 74 20 73 61 76 65 20 74 68 69 73 20 74 61 62
+    6c 65 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    00 00 00 00 00 00 00 41 53 61 76 69 6e 67 20 74
+    68 69 73 20 74 61 62 6c 65 20 77 69 74 68 20 74
+    68 69 73 20 76 65 72 73 69 6f 6e 20 6f 66 20 4a
+    4d 50 20 77 69 6c 6c 20 64 65 73 74 72 6f 79 20
+    74 68 65 20 64 61 74 61 2e 00 07 00 00 00
+    """
+)
 
-def write_jmp(df: pd.DataFrame, filename: str, compress: bool = True, version: str = "16.0") -> None:
+if len(MAGIC_JMP) + len(JMP17_PREAMBLE_AFTER_MAGIC) != JMP17_METADATA_OFFSET:
+    raise RuntimeError("JMP17 preamble length does not align with metadata offset")
+
+
+def _column_visibility_record_len(n_visible: int, n_hidden: int) -> int:
+    """Length field used by JMP 17 before visible/hidden column metadata."""
+    return 18 + 4 * (n_visible + n_hidden) + 2 * (n_visible + n_hidden)
+
+
+def write_jmp(
+    df: pd.DataFrame,
+    filename: str,
+    compress: bool = True,
+    version: str = SUPPORTED_WRITE_VERSION,
+) -> None:
     """
     Write a pandas DataFrame to a JMP file
 
@@ -33,8 +75,8 @@ def write_jmp(df: pd.DataFrame, filename: str, compress: bool = True, version: s
         Path to the output file
     compress : bool, default=True
         Whether to compress the data
-    version : str, default="16.0"
-        JMP version to use in the file header
+    version : str, default="17.2.0"
+        JMP file version to write. Currently only "17.2.0" is supported.
 
     Returns:
     --------
@@ -55,6 +97,12 @@ def write_jmp(df: pd.DataFrame, filename: str, compress: bool = True, version: s
     >>> # Write to a JMP file
     >>> jmpio.write_jmp(df, 'output.jmp')
     """
+    if version != SUPPORTED_WRITE_VERSION:
+        raise ValueError(
+            f"Unsupported JMP write version {version!r}; "
+            f"only {SUPPORTED_WRITE_VERSION!r} is currently supported"
+        )
+
     # Create directory if it doesn't exist
     directory = os.path.dirname(os.path.abspath(filename))
     if directory and not os.path.exists(directory):
@@ -66,12 +114,20 @@ def write_jmp(df: pd.DataFrame, filename: str, compress: bool = True, version: s
         write_file_header(file, df, version)
 
         # Write column metadata
-        column_offsets = write_column_metadata(file, df)
+        offset_table_pos = write_column_metadata(file, df)
 
         # Write column data
+        column_offsets = []
         for i, column_name in enumerate(df.columns):
+            column_offsets.append(file.tell())
             column_data = df[column_name]
             write_column_data(file, column_data, column_offsets[i], column_name, compress)
+
+        end_pos = file.tell()
+        file.seek(offset_table_pos)
+        for offset in column_offsets:
+            file.write(struct.pack("<q", offset))
+        file.seek(end_pos)
 
         # Any final corrections or clean-up
         finalize_file(file)
@@ -90,34 +146,27 @@ def write_file_header(file: BinaryIO, df: pd.DataFrame, version: str) -> None:
     version : str
         JMP version to use in the header
     """
-    # Write magic bytes (signature)
+    # JMP 17 places table metadata at byte 368 after a compatibility preamble.
+    # Native JMP-authored files in the fixture set share this preamble for
+    # ordinary data tables.
     file.write(MAGIC_JMP)
-
-    # Write padding up to the row offset
-    padding_size = 368 - len(MAGIC_JMP)
-    padding_data = bytearray([0] * padding_size)
-
-    # Add some metadata in the padding (this is reverse-engineered)
-    # Here we could add metadata like creation software, etc.
-    file.write(padding_data)
+    file.write(JMP17_PREAMBLE_AFTER_MAGIC)
 
     # Write number of rows (Int64) and columns (Int32)
     file.write(struct.pack("<q", len(df)))
     file.write(struct.pack("<i", len(df.columns)))
 
-    # Write unknown values (5 Int16s)
-    for _ in range(5):
-        file.write(struct.pack("<h", 0))
+    # Unknown values observed in JMP 17.2 files. The last value is the length
+    # marker for the following charset string.
+    file.write(struct.pack("<5h", 0, 4, 93, 0, 6))
 
-    # Write character set (typically ASCII or UTF-8)
-    charset = "UTF8"
-    file.write(struct.pack("<b", len(charset)))
-    file.write(charset.encode("utf-8"))
-    file.write(b"\0")  # Null terminator
+    # JMP strings in this section use a 4-byte little-endian length prefix.
+    charset = b"utf-8\0"
+    file.write(struct.pack("<i", len(charset)))
+    file.write(charset)
 
-    # Write some unknown values (3 UInt16s)
-    for _ in range(3):
-        file.write(struct.pack("<H", 0))
+    # The reader searches for these bytes: 07 00 08 00 00 00.
+    file.write(struct.pack("<3H", 7, 8, 0))
 
     # Write save time (current time as seconds since JMP epoch)
     current_time = datetime.now()
@@ -127,13 +176,22 @@ def write_file_header(file: BinaryIO, df: pd.DataFrame, version: str) -> None:
     # Write more unknown values (1 UInt16)
     file.write(struct.pack("<H", 18))  # From observed files
 
-    # Write build string with version
-    build_string = f"JMP Version {version}"
+    # Write build string with version.
+    build_string = f"Jul 23 2023, 19:09:15, Release, JMP, Version {version}".encode("utf-8")
     file.write(struct.pack("<i", len(build_string)))
-    file.write(build_string.encode("utf-8"))
+    file.write(build_string)
 
 
-def write_column_metadata(file: BinaryIO, df: pd.DataFrame) -> list[int]:
+def write_post_build_table_object(file: BinaryIO, n_visible: int, n_hidden: int) -> None:
+    """
+    Write the small JMP 17 table-object record that precedes column metadata.
+    """
+    record_len = _column_visibility_record_len(n_visible, n_hidden)
+    object_size = record_len + 56
+    file.write(struct.pack("<HIHHHII", 5, 4, 0, 1, 3, object_size, 0))
+
+
+def write_column_metadata(file: BinaryIO, df: pd.DataFrame) -> int:
     """
     Write metadata about columns
 
@@ -146,23 +204,21 @@ def write_column_metadata(file: BinaryIO, df: pd.DataFrame) -> list[int]:
 
     Returns:
     --------
-    list[int]
-        List of file offsets for each column's data
+    int
+        File position where the Int64 column-offset table starts
     """
-    # Write column metadata section marker
-    file.write(b"\xff\xff")
-
-    # Write some zeros (observed format)
-    file.write(struct.pack("<QQQQ", 0, 0, 0, 0))
-
-    # Write visible and hidden column counts
-    # For now, all columns are visible
+    # For now, all columns are visible.
     n_visible = len(df.columns)
     n_hidden = 0
-    file.write(struct.pack("<II", n_visible, n_hidden))
 
-    # Write some unknown values
-    file.write(struct.pack("<II", 0, 0))
+    write_post_build_table_object(file, n_visible, n_hidden)
+
+    # Write column visibility metadata section marker. The length field and
+    # object ids are modeled on simple native JMP 17 data tables.
+    file.write(b"\xff\xff")
+    file.write(struct.pack("<QH", _column_visibility_record_len(n_visible, n_hidden), 0))
+    file.write(struct.pack("<II", n_visible, n_hidden))
+    file.write(struct.pack("<HHHH", 0, 0x0077, 0x0190, 0x02CF))
 
     # Write visible column indices (0-based)
     for i in range(n_visible):
@@ -174,12 +230,15 @@ def write_column_metadata(file: BinaryIO, df: pd.DataFrame) -> list[int]:
         width = min(max(len(column_name) * 8, 40), 300)
         file.write(struct.pack("<H", width))
 
-    # Write some more unknown values
-    for _ in range(7):
-        file.write(struct.pack("<I", 0))
+    # Native JMP 17 files include a fixed 18-byte tagged record here. The
+    # reader preserves these bytes as seven UInt32 values for now.
+    file.write(b"\xfe\xff")
+    file.write(struct.pack("<qHIIII", 18, 3, 116, 112, 169, 113))
 
-    # Mark beginning of column data section
-    column_section_pos = file.tell()
+    # Native JMP 17 files include one more tagged record before the offset
+    # table. column_info() skips this marker and payload before reading ncols.
+    file.write(b"\xfd\xff")
+    file.write(struct.pack("<qHHI", 8, 1, 4, 0))
 
     # Write the number of columns again as a check
     file.write(struct.pack("<i", len(df.columns)))
@@ -189,34 +248,7 @@ def write_column_metadata(file: BinaryIO, df: pd.DataFrame) -> list[int]:
     for _ in range(len(df.columns)):
         file.write(struct.pack("<q", 0))  # Placeholder for column offsets
 
-    # Calculate the actual column offsets
-    # Start position for first column's data
-    data_start_pos = file.tell() + 1000  # Arbitrary buffer
-
-    # Align data start to 8-byte boundary for better performance
-    data_start_pos = (data_start_pos + 7) & ~7
-
-    # Seek to position to store column data
-    file.seek(data_start_pos)
-
-    # Calculate offsets for each column
-    column_offsets = []
-    for i, column_name in enumerate(df.columns):
-        column_offsets.append(file.tell())
-
-        # Skip ahead a reasonable amount to make room for column headers
-        # We'll come back and fill this in properly
-        file.write(bytearray([0] * 100))  # Arbitrary space for column header
-
-    # Go back and write the actual offsets
-    file.seek(offset_pos)
-    for offset in column_offsets:
-        file.write(struct.pack("<q", offset))
-
-    # Return to last position
-    file.seek(column_offsets[-1] + 100)
-
-    return column_offsets
+    return offset_pos
 
 
 def write_column_data(
@@ -242,15 +274,13 @@ def write_column_data(
     compress : bool, default=True
         Whether to compress the data
     """
-    # Save the current position so we can return to it
-    current_pos = file.tell()
-
     # Seek to the column's offset
     file.seek(offset)
 
     # Write column name
-    file.write(struct.pack("<h", len(column_name)))
-    file.write(column_name.encode("utf-8"))
+    encoded_name = str(column_name).encode("utf-8")
+    file.write(struct.pack("<h", len(encoded_name)))
+    file.write(encoded_name)
 
     # Determine data type and write appropriate type markers
     data_type = get_column_data_type(column)
@@ -275,9 +305,6 @@ def write_column_data(
         # Default to writing as string
         write_string_column(file, column, compress)
 
-    # Return to the previous position
-    file.seek(current_pos)
-
 
 def get_column_data_type(column: pd.Series) -> str:
     """
@@ -300,6 +327,9 @@ def get_column_data_type(column: pd.Series) -> str:
     if hasattr(dtype, "name"):
         dtype_name = dtype.name
 
+        if dtype_name == "string" or dtype_name.startswith("string"):
+            return "string"
+
         # Check for pandas nullable integer types
         if dtype_name in ["Int8", "Int16", "Int32", "Int64"]:
             return "int"
@@ -315,11 +345,12 @@ def get_column_data_type(column: pd.Series) -> str:
                 return "datetime"
 
     # Check numpy/pandas basic types
-    if np.issubdtype(dtype, np.integer):
-        return "int"
-    elif np.issubdtype(dtype, np.floating):
-        return "float"
-    elif np.issubdtype(dtype, np.datetime64):
+    try:
+        np_dtype = np.dtype(dtype)
+    except TypeError:
+        return "string"
+
+    if np.issubdtype(np_dtype, np.datetime64):
         # Try to distinguish date from datetime
         try:
             # Check if all values have time component equal to midnight
@@ -336,8 +367,12 @@ def get_column_data_type(column: pd.Series) -> str:
                 return "date"
         except (AttributeError, TypeError):
             return "datetime"
-    elif np.issubdtype(dtype, np.timedelta64):
+    elif np.issubdtype(np_dtype, np.timedelta64):
         return "duration"
+    elif np.issubdtype(np_dtype, np.integer):
+        return "int"
+    elif np.issubdtype(np_dtype, np.floating):
+        return "float"
     elif dtype == "object":
         # Check first non-null value type
         non_null = column.dropna()
@@ -377,7 +412,7 @@ def write_float_column(file: BinaryIO, column: pd.Series, compress: bool) -> Non
         Whether to compress the data
     """
     # Type markers for float64
-    dt1 = 0x09 if compress else 0x01  # 0x09 for compressed data
+    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
     dt2, dt3, dt4, dt5, dt6 = 0x01, 0x00, 0x00, 0x00, 0x08
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
@@ -452,7 +487,7 @@ def write_int_column(file: BinaryIO, column: pd.Series, compress: bool) -> None:
             dt6 = 0x04
 
     # Type markers for integer
-    dt1 = 0x09 if compress else 0x01  # 0x09 for compressed data
+    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
     dt2, dt3, dt4, dt5 = 0x01, 0x00, 0x00, 0x00
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
@@ -500,27 +535,27 @@ def write_string_column(file: BinaryIO, column: pd.Series, compress: bool) -> No
     column = column.fillna("")
 
     # Get string lengths
-    string_lengths = column.str.len()
-    max_length = string_lengths.max()
-    min_length = string_lengths.min()
+    encoded_strings = [str(s).encode("utf-8") for s in column]
+    string_lengths = [len(s) for s in encoded_strings]
+    max_length = max(string_lengths, default=0)
+    min_length = min(string_lengths, default=0)
 
     # Determine if we should use fixed width or variable width
-    use_fixed_width = max_length == min_length and max_length > 0
+    use_fixed_width = max_length == min_length and 0 < max_length <= 255
 
     if use_fixed_width:
         # For fixed width strings
         dt1 = 0x09 if compress else 0x02  # 0x09 for compressed data
         dt2, dt3, dt4 = 0x01, 0x00, 0x00
-        dt5 = min(max_length, 65535)  # Max width is UInt16 max
+        dt5 = max_length
         dt6 = 0x00
 
         file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
         # Create a byte array of fixed width strings
         string_data = bytearray()
-        for s in column:
+        for encoded in encoded_strings:
             # Encode the string as UTF-8 and pad/truncate to fixed width
-            encoded = s.encode("utf-8")
             padded = encoded[:dt5].ljust(dt5, b"\0")
             string_data.extend(padded)
 
@@ -546,7 +581,7 @@ def write_string_column(file: BinaryIO, column: pd.Series, compress: bool) -> No
     else:
         # For variable width strings
         dt1 = 0x09  # Always use compression for variable width
-        dt2, dt3, dt4, dt5, dt6 = 0x01, 0x00, 0x00, 0x00, 0x00
+        dt2, dt3, dt4, dt5, dt6 = 0x02, 0x00, 0x00, 0x00, 0x00
 
         file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
@@ -557,14 +592,13 @@ def write_string_column(file: BinaryIO, column: pd.Series, compress: bool) -> No
 
         # Prepare header
         header = bytearray([0] * 13)
-        header[9] = 2 if use_int16 else 1  # Width bytes
+        header[8] = 2 if use_int16 else 1  # Width bytes
 
         # Prepare lengths and string data
         lengths = bytearray()
         string_data = bytearray()
 
-        for s in column:
-            encoded = s.encode("utf-8")
+        for encoded in encoded_strings:
             string_data.extend(encoded)
 
             if use_int16:
@@ -603,7 +637,7 @@ def write_datetime_column(file: BinaryIO, column: pd.Series, compress: bool) -> 
         Whether to compress the data
     """
     # Type markers for datetime
-    dt1 = 0x09 if compress else 0x01  # 0x09 for compressed data
+    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
     dt2, dt3, dt4, dt5, dt6 = 0x01, 0x00, 0x69, 0x69, 0x08
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
@@ -657,7 +691,7 @@ def write_date_column(file: BinaryIO, column: pd.Series, compress: bool) -> None
         Whether to compress the data
     """
     # Type markers for date
-    dt1 = 0x09 if compress else 0x01  # 0x09 for compressed data
+    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
     dt2, dt3, dt4, dt5, dt6 = 0x01, 0x00, 0x65, 0x65, 0x08
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
@@ -713,7 +747,7 @@ def write_time_column(file: BinaryIO, column: pd.Series, compress: bool) -> None
         Whether to compress the data
     """
     # Type markers for time
-    dt1 = 0x09 if compress else 0x01  # 0x09 for compressed data
+    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
     dt2, dt3, dt4, dt5, dt6 = 0x01, 0x00, 0x82, 0x82, 0x08
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
@@ -767,7 +801,7 @@ def write_duration_column(file: BinaryIO, column: pd.Series, compress: bool) -> 
         Whether to compress the data
     """
     # Type markers for duration
-    dt1 = 0x09 if compress else 0x01  # 0x09 for compressed data
+    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
     dt2, dt3, dt4, dt5, dt6 = 0x01, 0x00, 0x6C, 0x6C, 0x08
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
