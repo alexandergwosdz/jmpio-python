@@ -203,16 +203,16 @@ def read_column_data(file: BinaryIO, info: JMPInfo, column_idx: int) -> Any:
                 if len(row_data_bytes) < width:
                     raise EOFError(f"Not enough data for row state in {column_name}")
 
-                marker_idx = bit_cat(row_data_bytes[6], row_data_bytes[7])
+                marker_idx = bit_cat(row_data_bytes[6], row_data_bytes[5])
                 marker = ROWSTATE_MARKERS[marker_idx] if marker_idx < len(ROWSTATE_MARKERS) else chr(marker_idx)
 
                 r, g, b = 0.0, 0.0, 0.0
-                if row_data_bytes[4] == 0xFF:
-                    r = row_data_bytes[3] / 255.0
-                    g = row_data_bytes[2] / 255.0
-                    b = row_data_bytes[1] / 255.0
+                if row_data_bytes[3] == 0xFF:
+                    r = row_data_bytes[2] / 255.0
+                    g = row_data_bytes[1] / 255.0
+                    b = row_data_bytes[0] / 255.0
                 else:
-                    color_idx = row_data_bytes[1]
+                    color_idx = row_data_bytes[0]
                     if 0 <= color_idx < len(ROWSTATE_COLORS):
                         hex_color = ROWSTATE_COLORS[color_idx]
                         r, g, b = hex_to_rgb(hex_color)
@@ -242,7 +242,7 @@ def read_column_data(file: BinaryIO, info: JMPInfo, column_idx: int) -> Any:
                 for i in range(info.nrows):
                     start = i * width
                     s_bytes = all_string_data[start : start + width]
-                    s = s_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
+                    s = s_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
                     strings.append(s)
                 return pd.Series(strings)
 
@@ -266,11 +266,14 @@ def read_column_data(file: BinaryIO, info: JMPInfo, column_idx: int) -> Any:
                         # Indices to pool
                         wb = buf.read(1)[0]
                         if wb == 1:
-                            idx_dtype = np.int8
+                            idx_dtype = np.uint8
                             idx_itemsize = 1
                         elif wb == 2:
-                            idx_dtype = np.int16
+                            idx_dtype = np.dtype("<u2")
                             idx_itemsize = 2
+                        elif wb == 4:
+                            idx_dtype = np.dtype("<u4")
+                            idx_itemsize = 4
                         else:
                             raise ValueError(f"Unknown index width byte {wb} for pooled var char in {column_name}")
 
@@ -302,7 +305,7 @@ def read_column_data(file: BinaryIO, info: JMPInfo, column_idx: int) -> Any:
                         return pd.Series(strings)
 
                     # Non-pooled compressed variable-width strings
-                    data_payload_source.seek(9)
+                    data_payload_source.seek(8)
                     width_bytes_val = data_payload_source.read(1)[0]
                     lengths_offset_in_payload = 13
                     data_payload_source.seek(lengths_offset_in_payload)
@@ -321,9 +324,10 @@ def read_column_data(file: BinaryIO, info: JMPInfo, column_idx: int) -> Any:
                     string_data_block = data_payload_source.read()
                     current_offset_in_strings = 0
                     for length in lengths:
-                        s_bytes = string_data_block[current_offset_in_strings : current_offset_in_strings + length]
+                        length_int = int(length)
+                        s_bytes = string_data_block[current_offset_in_strings : current_offset_in_strings + length_int]
                         strings.append(s_bytes.decode("utf-8", errors="replace"))
-                        current_offset_in_strings += int(length)
+                        current_offset_in_strings += length_int
                     return pd.Series(strings)
                 else:
                     # Uncompressed variable width
@@ -356,10 +360,28 @@ def read_column_data(file: BinaryIO, info: JMPInfo, column_idx: int) -> Any:
                     all_string_data_bytes = file.read(sum_lengths)
                     current_offset = 0
                     for length in lengths:
-                        s_bytes = all_string_data_bytes[current_offset : current_offset + length]
+                        length_int = int(length)
+                        s_bytes = all_string_data_bytes[current_offset : current_offset + length_int]
                         strings.append(s_bytes.decode("utf-8", errors="replace"))
-                        current_offset += int(length)
+                        current_offset += length_int
                     return pd.Series(strings)
+
+        elif dt1 == 0x03 and dt2 == 0x03:
+            if not is_compressed:
+                file.seek(start_pos_after_dt)
+                uncompressed_data_block_bytes = file.read(col_end - start_pos_after_dt)
+                data_payload_source = io.BytesIO(uncompressed_data_block_bytes)
+
+            if data_payload_source is None:
+                raise ValueError("data_payload_source not initialized for Int64 row state type")
+
+            width = dt5
+            data_size = width * info.nrows
+            data_payload_source.seek(-data_size, 2)
+            raw_data = data_payload_source.read(data_size)
+            if len(raw_data) < data_size:
+                raise EOFError(f"Not enough data for Int64 row state column {column_name}")
+            return pd.Series(np.frombuffer(raw_data, dtype=np.dtype("<i8")))
 
     except struct.error as e:
         print(

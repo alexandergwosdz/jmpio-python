@@ -1,0 +1,43 @@
+Names Default To Here( 1 );
+
+out = "C:/GitHub/jmpio-python/examples/bogus_data_jmp17_native.jmp";
+
+dt = New Table( "Bogus Data JMP17 Native",
+	Add Rows( 5 ),
+	New Column(
+		"Batch",
+		Character,
+		Nominal,
+		Set Values( {"BOGUS-001", "BOGUS-002", "BOGUS-003", "BOGUS-004", "BOGUS-005"} )
+	),
+	New Column(
+		"Material",
+		Character,
+		Nominal,
+		Set Values( {"Placebo", "Control", "Reference", "Challenge", "Discard"} )
+	),
+	New Column(
+		"Assay",
+		Numeric,
+		Continuous,
+		Format( "Fixed Dec", 10, 2 ),
+		Set Values( [101.20, 98.70, ., 104.40, 99.90] )
+	),
+	New Column(
+		"Impurity_pct",
+		Numeric,
+		Continuous,
+		Format( "Fixed Dec", 10, 3 ),
+		Set Values( [0.120, 0.180, 0.090, ., 0.210] )
+	),
+	New Column(
+		"Result",
+		Character,
+		Nominal,
+		Set Values( {"Pass", "Pass", "Investigate", "Pass", "Fail"} )
+	)
+);
+
+dt << Save( out );
+Close( dt, No Save );
+Quit();
