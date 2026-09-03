@@ -18,6 +18,7 @@ from .constants import (
     ROWSTATE_COLORS,
     ROWSTATE_MARKERS,
 )
+from .jsl import JSLAutomationError, validate_jmp_with_jsl, write_jmp_with_jsl
 from .types import RowState
 
 SUPPORTED_WRITE_VERSION = "17.2.0"
@@ -100,6 +101,9 @@ def write_jmp(
     filename: str,
     compress: bool = True,
     version: str = SUPPORTED_WRITE_VERSION,
+    engine: str = "python",
+    jmp_executable: str | os.PathLike[str] | None = None,
+    jsl_timeout: float = 60,
 ) -> None:
     """
     Write a pandas DataFrame to a JMP file
@@ -113,7 +117,17 @@ def write_jmp(
     compress : bool, default=True
         Whether to compress the data
     version : str, default="17.2.0"
-        JMP file version to write. Currently only "17.2.0" is supported.
+        JMP file version to write with the Python writer. Currently only
+        "17.2.0" is supported.
+    engine : {"python", "jsl", "auto"}, default="python"
+        Writer engine. "python" uses jmpio's native binary writer. "jsl" uses
+        a local JMP installation through generated JSL scripts. "auto" writes
+        with the Python writer and falls back to JSL if JMP validation fails.
+    jmp_executable : str or path-like, optional
+        Path to JMP executable for "jsl" or "auto" engines. If omitted,
+        JMPIO_JMP_EXE and common install locations are searched.
+    jsl_timeout : float, default=60
+        Seconds to wait for each JMP automation script.
 
     Returns:
     --------
@@ -134,12 +148,52 @@ def write_jmp(
     >>> # Write to a JMP file
     >>> jmpio.write_jmp(df, 'output.jmp')
     """
+    engine = engine.lower()
+    if engine not in {"python", "jsl", "auto"}:
+        raise ValueError("engine must be one of 'python', 'jsl', or 'auto'")
+
+    if engine == "jsl":
+        write_jmp_with_jsl(
+            df,
+            filename,
+            jmp_executable=jmp_executable,
+            timeout=jsl_timeout,
+        )
+        return
+
     if version != SUPPORTED_WRITE_VERSION:
         raise ValueError(
             f"Unsupported JMP write version {version!r}; "
             f"only {SUPPORTED_WRITE_VERSION!r} is currently supported"
         )
 
+    _write_jmp_python(df, filename, compress=compress, version=version)
+
+    if engine == "auto":
+        try:
+            validate_jmp_with_jsl(
+                filename,
+                jmp_executable=jmp_executable,
+                timeout=jsl_timeout,
+            )
+        except FileNotFoundError:
+            return
+        except JSLAutomationError:
+            write_jmp_with_jsl(
+                df,
+                filename,
+                jmp_executable=jmp_executable,
+                timeout=jsl_timeout,
+            )
+
+
+def _write_jmp_python(
+    df: pd.DataFrame,
+    filename: str,
+    compress: bool = True,
+    version: str = SUPPORTED_WRITE_VERSION,
+) -> None:
+    """Write a pandas DataFrame using jmpio's native binary writer."""
     # Create directory if it doesn't exist
     directory = os.path.dirname(os.path.abspath(filename))
     if directory and not os.path.exists(directory):
