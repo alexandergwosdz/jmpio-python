@@ -58,6 +58,43 @@ def _column_visibility_record_len(n_visible: int, n_hidden: int) -> int:
     return 18 + 4 * (n_visible + n_hidden) + 2 * (n_visible + n_hidden)
 
 
+def _write_compressed_column_prefix(file: BinaryIO, property_count: int = 3) -> None:
+    """
+    Write native JMP 17 per-column object records before compressed payload.
+    """
+    if property_count == 4:
+        file.write(
+            bytes.fromhex(
+                """
+                00 00 00 00 00 00 00 00 00 00 00 00 00 00
+                04 00 20 00 00 00 00 00 02 00 00 00 00 00
+                0b 00 02 00 00 00 40 00
+                17 00 02 00 00 00 02 00
+                20 00 02 00 00 00 42 00
+                02 01 00 00
+                """
+            )
+        )
+        return
+
+    file.write(
+        bytes.fromhex(
+            """
+            00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+            03 00 18 00 00 00 00 00 02 00 00 00 00 00
+            17 00 02 00 00 00 00 00
+            20 00 02 00 00 00 2d 00
+            01 01 00 00
+            """
+        )
+    )
+
+
+def _gzip_compress(data: bytes) -> bytes:
+    """Return deterministic gzip bytes like native JMP fixtures."""
+    return gzip.compress(data, mtime=0)
+
+
 def write_jmp(
     df: pd.DataFrame,
     filename: str,
@@ -411,20 +448,21 @@ def write_float_column(file: BinaryIO, column: pd.Series, compress: bool) -> Non
     compress : bool
         Whether to compress the data
     """
-    # Type markers for float64
-    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
-    dt2, dt3, dt4, dt5, dt6 = 0x01, 0x00, 0x00, 0x00, 0x08
+    # Type markers for float64. Compressed numeric columns in native JMP 17
+    # files use the 0x63 storage markers before the gzip payload.
+    if compress:
+        dt1, dt2, dt3, dt4, dt5, dt6 = 0x0A, 0x00, 0x0C, 0x63, 0x63, 0x08
+    else:
+        dt1, dt2, dt3, dt4, dt5, dt6 = 0x01, 0x01, 0x00, 0x00, 0x00, 0x08
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
     # Convert to numpy array, handling missing values
     data = column.fillna(np.nan).to_numpy(dtype=np.float64)
 
     if compress:
-        # Write some header data for compressed
-        file.write(bytearray([0] * 8))
+        _write_compressed_column_prefix(file)
 
-        # Compress the data
-        compressed_data = gzip.compress(data.tobytes())
+        compressed_data = _gzip_compress(data.tobytes())
 
         # Write gzip section marker
         file.write(GZIP_SECTION_START)
@@ -486,9 +524,13 @@ def write_int_column(file: BinaryIO, column: pd.Series, compress: bool) -> None:
             np_dtype = np.int32
             dt6 = 0x04
 
-    # Type markers for integer
-    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
-    dt2, dt3, dt4, dt5 = 0x01, 0x00, 0x00, 0x00
+    # Type markers for integer. Native compressed integer columns use
+    # compressed numeric storage markers and encode width in dt3/dt6.
+    if compress:
+        dt3_by_width = {1: 0x04, 2: 0x08, 4: 0x0C}
+        dt1, dt2, dt3, dt4, dt5 = 0x0A, 0x00, dt3_by_width[element_size], 0x63, 0x63
+    else:
+        dt1, dt2, dt3, dt4, dt5 = 0x01, 0x01, 0x00, 0x00, 0x00
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
     # For missing values, use dtype's minimum value + 1 as sentinel
@@ -498,11 +540,9 @@ def write_int_column(file: BinaryIO, column: pd.Series, compress: bool) -> None:
     data = column.fillna(sentinel).to_numpy(dtype=np_dtype)
 
     if compress:
-        # Write some header data for compressed columns
-        file.write(bytearray([0] * 8))
+        _write_compressed_column_prefix(file)
 
-        # Compress the data
-        compressed_data = gzip.compress(data.tobytes())
+        compressed_data = _gzip_compress(data.tobytes())
 
         # Write gzip section marker
         file.write(GZIP_SECTION_START)
@@ -540,12 +580,48 @@ def write_string_column(file: BinaryIO, column: pd.Series, compress: bool) -> No
     max_length = max(string_lengths, default=0)
     min_length = min(string_lengths, default=0)
 
+    if compress:
+        # Native compressed character columns are stored as variable-width
+        # payloads, even when every string currently has the same width.
+        dt1, dt2, dt3, dt4, dt5, dt6 = 0x09, 0x02, 0x00, 0x00, 0x00, 0x00
+        file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
+        _write_compressed_column_prefix(file, property_count=4)
+
+        use_int16 = max_length >= 128
+
+        lengths = bytearray()
+        string_data = bytearray()
+
+        for encoded in encoded_strings:
+            string_data.extend(encoded)
+
+            if use_int16:
+                lengths.extend(struct.pack("<h", len(encoded)))
+            else:
+                lengths.extend(struct.pack("<b", len(encoded)))
+
+        header = bytearray([0] * 13)
+        header[8] = 2 if use_int16 else 1  # Width bytes
+        struct.pack_into(
+            "<q", header, 0, len(header) + len(lengths) + len(string_data) - 8
+        )
+        struct.pack_into("<i", header, 9, max_length)
+
+        all_data = header + lengths + string_data
+        compressed_data = _gzip_compress(all_data)
+
+        file.write(GZIP_SECTION_START)
+        file.write(struct.pack("<Q", len(compressed_data)))  # compressed size
+        file.write(struct.pack("<Q", len(all_data)))  # uncompressed size
+        file.write(compressed_data)
+        return
+
     # Determine if we should use fixed width or variable width
     use_fixed_width = max_length == min_length and 0 < max_length <= 255
 
     if use_fixed_width:
         # For fixed width strings
-        dt1 = 0x09 if compress else 0x02  # 0x09 for compressed data
+        dt1 = 0x02
         dt2, dt3, dt4 = 0x01, 0x00, 0x00
         dt5 = max_length
         dt6 = 0x00
@@ -559,28 +635,11 @@ def write_string_column(file: BinaryIO, column: pd.Series, compress: bool) -> No
             padded = encoded[:dt5].ljust(dt5, b"\0")
             string_data.extend(padded)
 
-        if compress:
-            # Write some header for compressed data
-            file.write(bytearray([0] * 8))
-
-            # Compress the string data
-            compressed_data = gzip.compress(string_data)
-
-            # Write gzip section marker
-            file.write(GZIP_SECTION_START)
-
-            # Write compressed and uncompressed sizes
-            file.write(struct.pack("<Q", len(compressed_data)))  # compressed size
-            file.write(struct.pack("<Q", len(string_data)))  # uncompressed size
-
-            # Write the compressed data
-            file.write(compressed_data)
-        else:
-            # Write raw string data
-            file.write(string_data)
+        # Write raw string data
+        file.write(string_data)
     else:
         # For variable width strings
-        dt1 = 0x09  # Always use compression for variable width
+        dt1 = 0x09
         dt2, dt3, dt4, dt5, dt6 = 0x02, 0x00, 0x00, 0x00, 0x00
 
         file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
@@ -589,10 +648,6 @@ def write_string_column(file: BinaryIO, column: pd.Series, compress: bool) -> No
 
         # Determine width needed for length values
         use_int16 = max_length >= 128
-
-        # Prepare header
-        header = bytearray([0] * 13)
-        header[8] = 2 if use_int16 else 1  # Width bytes
 
         # Prepare lengths and string data
         lengths = bytearray()
@@ -606,11 +661,18 @@ def write_string_column(file: BinaryIO, column: pd.Series, compress: bool) -> No
             else:
                 lengths.extend(struct.pack("<b", len(encoded)))
 
+        # Prepare header
+        header = bytearray([0] * 13)
+        header[8] = 2 if use_int16 else 1  # Width bytes
+        struct.pack_into(
+            "<q", header, 0, len(header) + len(lengths) + len(string_data) - 8
+        )
+        struct.pack_into("<i", header, 9, max_length)
+
         # Combine all data
         all_data = header + lengths + string_data
 
-        # Always compress variable width strings
-        compressed_data = gzip.compress(all_data)
+        compressed_data = _gzip_compress(all_data)
 
         # Write gzip section marker
         file.write(GZIP_SECTION_START)
@@ -637,8 +699,10 @@ def write_datetime_column(file: BinaryIO, column: pd.Series, compress: bool) -> 
         Whether to compress the data
     """
     # Type markers for datetime
-    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
-    dt2, dt3, dt4, dt5, dt6 = 0x01, 0x00, 0x69, 0x69, 0x08
+    if compress:
+        dt1, dt2, dt3, dt4, dt5, dt6 = 0x0A, 0x00, 0x16, 0x7E, 0x7E, 0x08
+    else:
+        dt1, dt2, dt3, dt4, dt5, dt6 = 0x01, 0x01, 0x00, 0x69, 0x69, 0x08
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
     # Convert to seconds since JMP epoch
@@ -657,11 +721,9 @@ def write_datetime_column(file: BinaryIO, column: pd.Series, compress: bool) -> 
     data = epoch_seconds.to_numpy(dtype=np.float64)
 
     if compress:
-        # Write some header for compressed data
-        file.write(bytearray([0] * 8))
+        _write_compressed_column_prefix(file)
 
-        # Compress the data
-        compressed_data = gzip.compress(data.tobytes())
+        compressed_data = _gzip_compress(data.tobytes())
 
         # Write gzip section marker
         file.write(GZIP_SECTION_START)
@@ -691,8 +753,10 @@ def write_date_column(file: BinaryIO, column: pd.Series, compress: bool) -> None
         Whether to compress the data
     """
     # Type markers for date
-    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
-    dt2, dt3, dt4, dt5, dt6 = 0x01, 0x00, 0x65, 0x65, 0x08
+    if compress:
+        dt1, dt2, dt3, dt4, dt5, dt6 = 0x0A, 0x00, 0x0C, 0x7F, 0x7F, 0x08
+    else:
+        dt1, dt2, dt3, dt4, dt5, dt6 = 0x01, 0x01, 0x00, 0x65, 0x65, 0x08
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
     # Convert to seconds since JMP epoch (with time part set to 00:00:00)
@@ -713,11 +777,9 @@ def write_date_column(file: BinaryIO, column: pd.Series, compress: bool) -> None
     data = epoch_seconds.to_numpy(dtype=np.float64)
 
     if compress:
-        # Write some header for compressed data
-        file.write(bytearray([0] * 8))
+        _write_compressed_column_prefix(file)
 
-        # Compress the data
-        compressed_data = gzip.compress(data.tobytes())
+        compressed_data = _gzip_compress(data.tobytes())
 
         # Write gzip section marker
         file.write(GZIP_SECTION_START)
@@ -747,8 +809,10 @@ def write_time_column(file: BinaryIO, column: pd.Series, compress: bool) -> None
         Whether to compress the data
     """
     # Type markers for time
-    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
-    dt2, dt3, dt4, dt5, dt6 = 0x01, 0x00, 0x82, 0x82, 0x08
+    if compress:
+        dt1, dt2, dt3, dt4, dt5, dt6 = 0x0A, 0x00, 0x0C, 0x82, 0x82, 0x08
+    else:
+        dt1, dt2, dt3, dt4, dt5, dt6 = 0x01, 0x01, 0x00, 0x82, 0x82, 0x08
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
     # Convert time to seconds since midnight
@@ -767,11 +831,9 @@ def write_time_column(file: BinaryIO, column: pd.Series, compress: bool) -> None
     data = seconds.to_numpy(dtype=np.float64)
 
     if compress:
-        # Write some header for compressed data
-        file.write(bytearray([0] * 8))
+        _write_compressed_column_prefix(file)
 
-        # Compress the data
-        compressed_data = gzip.compress(data.tobytes())
+        compressed_data = _gzip_compress(data.tobytes())
 
         # Write gzip section marker
         file.write(GZIP_SECTION_START)
@@ -801,8 +863,10 @@ def write_duration_column(file: BinaryIO, column: pd.Series, compress: bool) -> 
         Whether to compress the data
     """
     # Type markers for duration
-    dt1 = 0x0A if compress else 0x01  # 0x0A for compressed numeric data
-    dt2, dt3, dt4, dt5, dt6 = 0x01, 0x00, 0x6C, 0x6C, 0x08
+    if compress:
+        dt1, dt2, dt3, dt4, dt5, dt6 = 0x0A, 0x00, 0x0C, 0x85, 0x85, 0x08
+    else:
+        dt1, dt2, dt3, dt4, dt5, dt6 = 0x01, 0x01, 0x00, 0x6C, 0x6C, 0x08
     file.write(struct.pack("<BBBBBB", dt1, dt2, dt3, dt4, dt5, dt6))
 
     # Convert duration to seconds
@@ -821,11 +885,9 @@ def write_duration_column(file: BinaryIO, column: pd.Series, compress: bool) -> 
     data = seconds.to_numpy(dtype=np.float64)
 
     if compress:
-        # Write some header for compressed data
-        file.write(bytearray([0] * 8))
+        _write_compressed_column_prefix(file)
 
-        # Compress the data
-        compressed_data = gzip.compress(data.tobytes())
+        compressed_data = _gzip_compress(data.tobytes())
 
         # Write gzip section marker
         file.write(GZIP_SECTION_START)
@@ -929,10 +991,8 @@ def write_rowstate_column(file: BinaryIO, column: pd.Series, compress: bool) -> 
         row_data.extend(data_entry)
 
     # Compress row state data
-    compressed_data = gzip.compress(row_data)
-
-    # Write some header for compressed data
-    file.write(bytearray([0] * 8))
+    compressed_data = _gzip_compress(row_data)
+    _write_compressed_column_prefix(file)
 
     # Write gzip section marker
     file.write(GZIP_SECTION_START)

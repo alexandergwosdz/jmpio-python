@@ -2,6 +2,7 @@
 Tests for jmpio writer functionality
 """
 
+import gzip
 import os
 import struct
 import tempfile
@@ -11,7 +12,7 @@ import pandas as pd
 import pytest
 
 from jmpio import read_jmp, write_jmp
-from jmpio.constants import MAGIC_JMP
+from jmpio.constants import GZIP_SECTION_START, MAGIC_JMP
 from jmpio.metadata import read_metadata
 from jmpio.writer import JMP17_METADATA_OFFSET, JMP17_PREAMBLE_AFTER_MAGIC
 
@@ -185,6 +186,61 @@ def test_write_jmp17_native_table_structure_records():
         after_widths = visibility_marker + 2 + 10 + 8 + 8 + 4 * ncols + 2 * ncols
         assert data[after_widths : after_widths + 2] == b"\xfe\xff"
         assert data[after_widths + 28 : after_widths + 30] == b"\xfd\xff"
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def test_compressed_string_column_uses_native_header():
+    """Test compressed string column bytes required by JMP 17."""
+    df = pd.DataFrame(
+        {
+            "lot": ["ABCD", "WXYZ"],
+            "value": [1.25, 2.5],
+        }
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".jmp", delete=False) as temp:
+        temp_path = temp.name
+
+    try:
+        write_jmp(df, temp_path)
+
+        with open(temp_path, "rb") as file:
+            info = read_metadata(file)
+            file.seek(0)
+            data = file.read()
+
+        offset = info.column.offsets[0]
+        name_len = struct.unpack("<h", data[offset : offset + 2])[0]
+        body_start = offset + 2 + name_len
+
+        assert data[body_start : body_start + 6] == bytes.fromhex(
+            "09 02 00 00 00 00"
+        )
+
+        gzip_pos = data.find(GZIP_SECTION_START, body_start, info.column.offsets[1])
+        assert gzip_pos - body_start == 62
+
+        property_record_start = body_start + 6 + 14
+        assert data[property_record_start : property_record_start + 4] == struct.pack(
+            "<HH", 4, 32
+        )
+
+        compressed_len = struct.unpack(
+            "<Q", data[gzip_pos + 4 : gzip_pos + 12]
+        )[0]
+        uncompressed_len = struct.unpack(
+            "<Q", data[gzip_pos + 12 : gzip_pos + 20]
+        )[0]
+        payload = gzip.decompress(data[gzip_pos + 20 : gzip_pos + 20 + compressed_len])
+
+        assert uncompressed_len == len(payload)
+        assert struct.unpack("<q", payload[:8])[0] == len(payload) - 8
+        assert payload[8] == 1
+        assert struct.unpack("<i", payload[9:13])[0] == 4
+        assert payload[13:15] == b"\x04\x04"
+        assert payload[15:] == b"ABCDWXYZ"
     finally:
         if os.path.exists(temp_path):
             os.unlink(temp_path)

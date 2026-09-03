@@ -136,10 +136,6 @@ def test_jmpexamples_native_columns_have_property_blocks(path: Path):
 
 
 @pytest.mark.parametrize("path", JMPEXAMPLE_FILES, ids=lambda path: path.name)
-@pytest.mark.xfail(
-    strict=True,
-    reason="writer still omits native JMP per-column object/property records",
-)
 def test_writer_roundtrip_from_jmpexamples_has_native_column_blocks(path: Path):
     """Writer output from native examples should preserve native column structure."""
     _xfail_known_metadata_limitation(path)
