@@ -6,14 +6,15 @@ A Python package for reading and writing SAS JMP files.
 
 `jmpio` is a mostly-faithful Python port of the Julia package [JMPReader.jl](https://github.com/jaakkor2/JMPReader.jl) by [@jaakkor2](https://github.com/jaakkor2). It aims to be able to read and write binary JMP files from SAS JMP statistical software. There's no way this package would exist without @jaakor2's efforts.
 
-> [!WARNING]  
-> `jmpio` cannot actually write a valid jmp file - it's a work in progress.
-> `jmpio` is not particularly efficient and uses pandas DataFrames internally. 
+> [!WARNING]
+> `jmpio` write support is still experimental.
+> `jmpio` is not particularly efficient and uses pandas DataFrames internally.
 
 ## Features
 
 - Read JMP files into pandas DataFrames
-- Write pandas DataFrames to JMP files (eventually)
+- Write pandas DataFrames to JMP files (experimental)
+  - Optional JSL workflow using a local JMP installation
   - Embed Scripts in those files for plotting data.
 - Support for all JMP data types:
   - Numeric (Float64, Int8, Int16, Int32)
@@ -68,15 +69,23 @@ df = pd.DataFrame({
     'dates': [date(2023, 1, 1), date(2023, 2, 1), date(2023, 3, 1), date(2023, 4, 1)]
 })
 
-# Write to a JMP file with compression (default)
+# Write to a JMP file with compression using the native Python writer (default)
 jmpio.write_jmp(df, "output.jmp")
 
 # Write to a JMP file without compression
 jmpio.write_jmp(df, "output_uncompressed.jmp", compress=False)
 
-# Specify a specific JMP version
-jmpio.write_jmp(df, "output_v16.jmp", version="16.0")
+# Use a local JMP installation through generated JSL scripts
+jmpio.write_jmp(df, "output_native.jmp", engine="jsl")
+
+# Write with the Python writer, validate with JMP when available, and fall back
+# to JSL if JMP cannot open the Python-written file
+jmpio.write_jmp(df, "output_auto.jmp", engine="auto")
 ```
+
+The JSL workflow is optional and requires SAS JMP to be installed locally. By
+default, `jmpio` searches common Windows install paths and `JMPIO_JMP_EXE`; you
+can also pass `jmp_executable="C:/Program Files/SAS/JMP/17/jmp.exe"`.
 
 ## Supported Data Types
 
