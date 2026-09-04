@@ -87,6 +87,41 @@ The JSL workflow is optional and requires SAS JMP to be installed locally. By
 default, `jmpio` searches common Windows install paths and `JMPIO_JMP_EXE`; you
 can also pass `jmp_executable="C:/Program Files/SAS/JMP/17/jmp.exe"`.
 
+### Applying JMP column properties
+
+When JMP is installed locally, `jmpio` can use JSL automation to apply or dump
+column properties that are not written by the native Python binary writer:
+
+```python
+import jmpio
+
+jmpio.apply_column_properties_with_jsl(
+    "output.jmp",
+    [
+        {
+            "column": "Protein Concentration (mg/mL)",
+            "lsl": 90,
+            "usl": 110,
+            "show_limits": 0,
+        },
+        {
+            "column": "Aggregate (%)",
+            "control_limits": "{XBar(Avg(0.4), LCL(0.35), UCL(0.55))}",
+        },
+        {"column": "Total Purity (%)", "sigma": "0.007"},
+        {
+            "column": "PC^2",
+            "formula": ':"Protein Concentration (mg/mL)"n * :"Protein Concentration (mg/mL)"n',
+        },
+    ],
+)
+
+properties = jmpio.dump_column_properties_with_jsl("output.jmp")
+```
+
+Supported property fields are `lsl`, `usl`, `target`, `show_limits`,
+`control_limits`, `sigma`, and `formula`.
+
 ## Supported Data Types
 
 ### Reading
